@@ -12,7 +12,7 @@ The React interface exposes service and index status, indexing controls, grounde
 
 ## Demo
 
-![Human Pose Estimation RAG Demo](docs/images/demo.gif)
+[Watch the project demo](docs/images/demo.mp4)
 
 ## Architecture
 
