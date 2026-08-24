@@ -10,6 +10,10 @@ The project is designed around one primary Human Pose Estimation PDF. During ing
 
 The React interface exposes service and index status, indexing controls, grounded answers, retrieved excerpts, relevance scores, and source page numbers.
 
+## Demo
+
+![Human Pose Estimation RAG Demo](docs/images/demo.gif)
+
 ## Architecture
 
 - **React** provides the browser interface for indexing, configuration controls, questions, answers, and citations.
@@ -300,3 +304,5 @@ docker compose down -v
 ```
 
 It does not remove the host PDF, but it deletes downloaded models and indexed vectors and should only be used for a full reset.
+
+<!-- write-test -->
