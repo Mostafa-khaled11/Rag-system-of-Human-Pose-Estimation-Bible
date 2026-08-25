@@ -19,7 +19,7 @@ class SearchHit:
 
 class VectorStore:
     def __init__(self, url: str, collection: str, timeout: float) -> None:
-        self.client = AsyncQdrantClient(url=url, timeout=timeout)
+        self.client = AsyncQdrantClient(url=url, timeout=timeout, check_compatibility=False)
         self.collection = collection
 
     async def close(self) -> None:

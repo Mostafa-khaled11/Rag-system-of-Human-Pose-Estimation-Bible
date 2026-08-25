@@ -1,6 +1,7 @@
 import pytest
 
 from app.core.config import Settings
+from app.core.errors import AppError, ErrorCode
 from app.core.vector_store import DimensionMismatchError, SearchHit
 from app.ingestion.chunking import PageText, config_fingerprint
 from app.ingestion.pdf import ExtractedDocument
@@ -79,7 +80,7 @@ class EvidenceStore:
 @pytest.mark.asyncio
 async def test_answer_without_model_marker_gets_verified_page_marker() -> None:
     response = await RagService(Settings(_env_file=None), FakeOllama(), EvidenceStore()).query(
-        "question", None, None
+        "What is the supporting evidence?", None, None
     )
     assert response.answer.endswith("Supporting pages: [p. 7]")
 
@@ -87,8 +88,9 @@ async def test_answer_without_model_marker_gets_verified_page_marker() -> None:
 @pytest.mark.asyncio
 async def test_dimension_mismatch() -> None:
     service = RagService(Settings(_env_file=None), FakeOllama(), DimensionStore())
-    with pytest.raises(DimensionMismatchError):
+    with pytest.raises(AppError) as caught:
         await service.query("question", None, None)
+    assert caught.value.code == ErrorCode.INDEX_NOT_READY
 
 
 class ExistingStore:
@@ -107,7 +109,7 @@ async def test_idempotent_ingestion_skips_embeddings(monkeypatch, tmp_path) -> N
     source.touch()
     settings = Settings(_env_file=None, book_path=source)
     document = ExtractedDocument("book.pdf", "hash", [PageText(1, "text")], [])
-    monkeypatch.setattr("app.retrieval.service.extract_pdf", lambda *_: document)
+    monkeypatch.setattr("app.services.ingestion.extract_pdf", lambda *_: document)
     ollama = FakeOllama()
     response = await RagService(settings, ollama, ExistingStore()).ingest(False, None, None)
     assert response.status == "unchanged"

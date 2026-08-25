@@ -1,4 +1,4 @@
-.PHONY: up down logs ingest test lint build config
+.PHONY: up down logs ingest test lint build config evaluate evaluate-retrieval
 up:
 	docker compose up --build -d
 down:
@@ -17,4 +17,7 @@ build:
 	cd frontend && npm run build
 config:
 	docker compose config
-
+evaluate:
+	python -m evaluation.run
+evaluate-retrieval:
+	python -m evaluation.run --retrieval-only

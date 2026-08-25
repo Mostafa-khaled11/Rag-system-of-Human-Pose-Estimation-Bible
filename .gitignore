@@ -1,14 +1,17 @@
 .env
 .inspection-tools/
+.test-tmp/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .venv/
 node_modules/
+.npm-cache/
 dist/
 *.tsbuildinfo
 coverage/
 .coverage
+evaluation/reports/*.json
 data/source/*
 !data/source/.gitkeep

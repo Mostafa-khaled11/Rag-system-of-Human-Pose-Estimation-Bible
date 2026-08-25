@@ -8,7 +8,7 @@ Inference, embeddings, and vector storage run locally. No hosted model or cloud 
 
 The project is designed around one primary Human Pose Estimation PDF. During ingestion, the backend extracts text page by page, divides it into overlapping character-based chunks, embeds those chunks, and stores them in Qdrant. At query time, the same embedding model converts the user's question to a vector, Qdrant finds the most relevant book chunks, and Qwen generates a grounded answer from the retrieved evidence.
 
-The React interface exposes service and index status, indexing controls, grounded answers, retrieved excerpts, relevance scores, and source page numbers.
+The React interface exposes dependency and index status, indexing controls, progressively streamed grounded answers, retrieved excerpts, relevance scores, source page numbers, confidence, and query timing. Weak or irrelevant evidence is rejected before generation.
 
 ## Demo
 
@@ -17,15 +17,16 @@ The React interface exposes service and index status, indexing controls, grounde
 ## Architecture
 
 - **React** provides the browser interface for indexing, configuration controls, questions, answers, and citations.
-- **FastAPI** validates requests and coordinates PDF ingestion, retrieval, prompt construction, and response serialization.
+- **FastAPI** validates requests and delegates to focused embedding, retrieval, reranking, generation, and ingestion services.
 - **Ollama** serves both local models inside Docker.
 - **`nomic-embed-text:latest`** creates vectors for book chunks and user queries.
-- **Qdrant** stores chunk vectors and metadata and performs cosine-similarity retrieval.
+- **Qdrant** stores chunk vectors and metadata and returns a configurable candidate set.
+- **`lexical-v1` reranker** combines query-token overlap with vector similarity without loading another large model. It is optional and falls back to vector order if initialization or execution fails.
 - **`qwen2.5:1.5b`** generates an answer constrained by the retrieved passages.
 
 The basic query flow is:
 
-`User -> React -> FastAPI -> query embedding -> Qdrant -> relevant chunks -> Qwen -> grounded answer and page citations`
+`User -> React -> FastAPI -> embedding -> Qdrant candidates -> reranker -> top context -> Qwen -> streamed grounded answer and citations`
 
 ## Architecture Diagram
 
@@ -45,11 +46,22 @@ flowchart LR
         API --> QueryEmbed[nomic-embed-text]
         QueryEmbed --> VectorDB[Qdrant Active Index]
         Activate --> VectorDB
-        VectorDB --> Retrieve[Relevant Book Chunks]
-        Retrieve --> LLM[qwen2.5:1.5b]
-        LLM --> Answer[Grounded Answer + Page Citations]
+        VectorDB --> Candidates[Candidate Chunks]
+        Candidates --> Rerank[CPU Reranker]
+        Rerank --> Evidence{Enough Evidence?}
+        Evidence -->|yes| LLM[qwen2.5:1.5b]
+        Evidence -->|no| Insufficient[Insufficient Context]
+        LLM --> Answer[Streaming Grounded Answer + Citations]
         Answer --> API
         API --> UI
+    end
+
+    subgraph Evaluation[Offline evaluation]
+        Dataset[23 Book-Grounded Questions] --> Eval[Evaluation Runner]
+        Eval --> Base[Vector Baseline]
+        Eval --> New[Reranked Pipeline]
+        Base --> Report[JSON + Markdown Report]
+        New --> Report
     end
 ```
 
@@ -202,9 +214,102 @@ docker compose down
 | --- | --- |
 | React frontend | <http://localhost:3000> |
 | FastAPI OpenAPI documentation | <http://localhost:8000/docs> |
-| Backend health endpoint | <http://localhost:8000/health> |
+| Backend liveness endpoint | <http://localhost:8000/health> |
+| Dependency readiness endpoint | <http://localhost:8000/ready> |
+| Prometheus-compatible metrics | <http://localhost:8000/metrics> |
 
-The API also exposes `GET /api/config`, `GET /api/documents`, `POST /api/ingest`, and `POST /api/query`.
+The API also exposes `GET /api/config`, `GET /api/documents`, `POST /api/ingest`, the backward-compatible `POST /api/query`, and streaming `POST /api/query/stream`.
+
+## Retrieval, Reranking, and Evidence Policy
+
+When reranking is enabled, Qdrant retrieves `RETRIEVAL_CANDIDATE_COUNT` vector candidates (20 by default), and the local `lexical-v1` reranker combines normalized cosine similarity with query-token overlap before selecting `RETRIEVAL_TOP_K` passages (5 by default). It has no extra model download and is suitable for CPU-constrained development. Reranking defaults to off because the initial book evaluation showed unchanged Hit Rate but lower Recall and MRR; enable it only when calibration on the current index demonstrates a benefit.
+
+Generation is skipped unless the packed context contains enough passages and passes both `MINIMUM_EVIDENCE_SCORE` and `MINIMUM_LEXICAL_OVERLAP`. The prompt permits only retrieved context IDs. Returned page citations are derived server-side from those IDs, so arbitrary model-supplied page numbers do not enter the citation list. Insufficient evidence returns `answerable=false`, `insufficient_context=true`, a confidence score, and the stable message:
+
+> The retrieved passages do not contain enough information to answer this question reliably.
+
+## Streaming Protocol
+
+`POST /api/query/stream` returns newline-delimited JSON (`application/x-ndjson`). Events are typed as `status`, `retrieval`, `token`, `final`, `error`, and `done`. The final event contains the same structured response as `/api/query`, including citations, retrieved chunks, model names, confidence, reranker metadata, and stage timings. The React UI displays retrieval and generation states and renders source cards only after final metadata arrives.
+
+Nginx disables proxy buffering, caching, request buffering, and gzip for this route and uses 600-second upstream timeouts. This prevents the former short-proxy-timeout failure mode during slow CPU inference while still allowing tokens to reach the browser immediately.
+
+## Structured Errors and Reliability
+
+API errors use this stable shape:
+
+```json
+{
+  "error": {
+    "code": "OLLAMA_UNAVAILABLE",
+    "message": "A client-safe explanation.",
+    "retryable": true,
+    "request_id": "...",
+    "details": null
+  }
+}
+```
+
+Error codes include `OLLAMA_UNAVAILABLE`, `QDRANT_UNAVAILABLE`, `MODEL_NOT_FOUND`, `EMBEDDING_FAILED`, `RETRIEVAL_FAILED`, `GENERATION_FAILED`, `INVALID_REQUEST`, `INSUFFICIENT_CONTEXT`, `INDEX_NOT_READY`, and `QUERY_TIMEOUT`. Ollama embedding and non-streaming generation calls use bounded exponential-backoff retries. Connect, generation/read, Qdrant, retry-count, and backoff settings are configurable. Validation and missing-model errors are not retried.
+
+Every response includes `X-Request-ID`; structured JSON logs use the same ID and record question length rather than question text. Query logs include stage latency, candidate/final passage counts, pages, scores, and error code where applicable.
+
+## Metrics and Probes
+
+- `/health` is a cheap process liveness check with no dependency calls.
+- `/ready` checks Ollama reachability, required model availability, Qdrant reachability, and active-index metadata without running inference.
+- `/metrics` exposes Prometheus text metrics for total, successful, failed, and insufficient-context queries plus total, embedding, retrieval, reranking, and generation latency summaries.
+
+Example:
+
+```bash
+curl http://localhost:8000/metrics
+```
+
+## Configuration Reference
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `RETRIEVAL_CANDIDATE_COUNT` | `20` | Qdrant candidates before reranking. |
+| `RETRIEVAL_TOP_K` | `5` | Final passages sent to the generator. |
+| `RETRIEVAL_SCORE_THRESHOLD` | `0.0` | Qdrant-side minimum cosine score. |
+| `MINIMUM_EVIDENCE_SCORE` | `0.2` | Minimum best vector score needed to generate. |
+| `MINIMUM_LEXICAL_OVERLAP` | `0.05` | Minimum query/evidence token overlap needed to generate. |
+| `MINIMUM_EVIDENCE_PASSAGES` | `1` | Minimum usable packed passages. |
+| `RERANKING_ENABLED` | `false` | Enable the local reranking stage; off by default based on measured results. |
+| `RERANKER_MODEL` | `lexical-v1` | Lightweight reranker implementation. |
+| `RERANKER_VECTOR_WEIGHT` | `0.65` | Vector contribution to the combined rank score. |
+| `STREAMING_ENABLED` | `true` | Enable `/api/query/stream`. |
+| `OLLAMA_CONNECT_TIMEOUT_SECONDS` | `5` | Ollama connection timeout. |
+| `OLLAMA_TIMEOUT_SECONDS` | `300` | Ollama read/generation timeout. |
+| `QDRANT_TIMEOUT_SECONDS` | `15` | Vector-store operation timeout. |
+| `RETRY_COUNT` | `2` | Bounded retry count for eligible Ollama calls. |
+| `RETRY_BACKOFF_SECONDS` | `0.5` | Initial exponential-backoff delay. |
+| `LOG_LEVEL` | `INFO` | Structured application log level. |
+
+All supported settings and safe defaults are listed in `.env.example`.
+
+## RAG Evaluation
+
+`evaluation/dataset.jsonl` contains 23 questions derived from actual pages in the indexed HPE book: definitions, direct facts, comparisons, 2D/3D/monocular methods, heatmaps, regression, architectures, challenges, multi-page synthesis, and three deliberately unsupported questions. Expected answers are concise paraphrased key points rather than copied book passages.
+
+The runner calculates Hit Rate@K, expected-page Recall@K, MRR, key-point coverage, citation presence, citation-page correctness, whether citations came from retrieved passages, and unsupported-question rejection. It evaluates vector-only and reranked retrieval in the same run and reports the measured delta without assuming improvement.
+
+Run the full local evaluation against running Ollama and Qdrant services:
+
+```bash
+python -m evaluation.run
+```
+
+For the faster retrieval comparison without 23 generations:
+
+```bash
+python -m evaluation.run --retrieval-only
+```
+
+Reports are written to `evaluation/reports/latest.json` and `evaluation/reports/latest.md`. Full evaluation remains a documented local/manual check rather than a standard CI job because downloading and running the local models on every push would make CI slow and unreliable.
+
+The latest measured 23-question local run is recorded in `evaluation/reports/latest.md`: vector and reranked Hit Rate@5 were both 1.000; vector Recall@5/MRR were 0.779/0.883, while reranked Recall@5/MRR were 0.708/0.864. Generation key-point coverage was 0.692, all answerable responses had citations, all citations came from retrieved passages and included an expected page, and all three unsupported questions were rejected. These results are why reranking is available but disabled by default.
 
 ## Example Query and Response
 
@@ -234,11 +339,12 @@ The `docs/images/` directory is tracked with a placeholder so screenshots can be
 .
 |-- .github/workflows/ci.yml   # Backend and frontend continuous integration
 |-- backend/
-|   |-- app/                   # FastAPI, ingestion, retrieval, and service clients
-|   |-- tests/                 # Backend unit tests
+|   |-- app/                   # FastAPI, adapters, prompts, and focused services
+|   |-- tests/                 # Unit, API, integration-boundary, and failure tests
 |   `-- pyproject.toml         # Python dependencies and Ruff/Pytest configuration
 |-- data/source/               # Ignored location for the local source PDF
 |-- docs/images/               # Real UI screenshots when available
+|-- evaluation/                # Book-grounded dataset, metrics, runner, and reports
 |-- frontend/
 |   |-- src/                   # React application and Vitest tests
 |   `-- package.json           # Frontend scripts and dependencies
@@ -249,14 +355,14 @@ The `docs/images/` directory is tracked with a placeholder so screenshots can be
 
 ## Testing
 
-The basic checks do not require Ollama, Qdrant, a GPU, or the source PDF. Backend tests use fakes or mocked HTTP responses for external services.
+The fast checks do not require Ollama, Qdrant, a GPU, or the source PDF. Backend tests use fakes or mocked HTTP responses for external services and cover pipeline boundaries, API contracts, failure mapping, reranking fallback, streaming, persistence configuration, and the former Nginx 504 configuration.
 
 Run the same backend commands used by CI:
 
 ```bash
 cd backend
 python -m pip install -e ".[dev]"
-python -m ruff check .
+python -m ruff check . ../evaluation
 python -m pytest
 ```
 
@@ -280,7 +386,8 @@ docker compose --env-file .env.example config --quiet
 
 - CPU inference can be relatively slow; generation latency depends heavily on host hardware.
 - The lightweight 1.5B generation model may produce weaker answers than larger models.
-- The system constrains generation to retrieved text, but retrieval and citation grounding still need broader evaluation.
+- The dependency-free reranker is much lighter than a cross-encoder but may be weaker on paraphrases; its impact must be judged from the generated evaluation report.
+- Score and lexical evidence thresholds need calibration if the source, embedding model, or chunking strategy changes.
 - PDF extraction is text-based. Scanned or image-only pages require OCR, which is not implemented.
 - Diagrams, equations, complex layouts, and multi-column reading order may not survive PDF text extraction accurately.
 - Chunking is character-based rather than token-based, with heuristic boundary and heading detection.
@@ -288,11 +395,9 @@ docker compose --env-file .env.example config --quiet
 
 ## Future Improvements
 
-- Adopt a stronger generation model when suitable GPU hardware is available.
+- Adopt a stronger generation model or optional cross-encoder reranker when suitable GPU/RAM resources are available and evaluation demonstrates a benefit.
 - Add optional, documented GPU acceleration.
-- Create a book-specific RAG evaluation dataset and automated quality checks.
-- Add retrieval reranking and stronger citation-grounding validation.
-- Stream generated responses to the frontend.
+- Add OCR and layout-aware extraction for scanned or complex pages.
 - Support multiple books and document management.
 
 ## Data and Reset Safety

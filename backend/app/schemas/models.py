@@ -22,9 +22,15 @@ class IngestResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=2)
+    question: str = Field(min_length=2, max_length=2000)
     top_k: int | None = Field(default=None, ge=1, le=25)
     score_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
+
+
+class EvaluationRetrievalRequest(BaseModel):
+    question: str = Field(min_length=2, max_length=2000)
+    rerank: bool = True
+    top_k: int | None = Field(default=None, ge=1, le=25)
 
 
 class Citation(BaseModel):
@@ -40,9 +46,11 @@ class RetrievedChunk(Citation):
 
 
 class Timing(BaseModel):
-    retrieval_ms: float
-    generation_ms: float
-    total_ms: float
+    embedding_ms: float = 0
+    retrieval_ms: float = 0
+    reranking_ms: float = 0
+    generation_ms: float = 0
+    total_ms: float = 0
 
 
 class QueryResponse(BaseModel):
@@ -53,6 +61,24 @@ class QueryResponse(BaseModel):
     generation_model: str
     embedding_model: str
     timing: Timing
+    request_id: str = ""
+    answerable: bool = True
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    insufficient_context: bool = False
+    reranking_applied: bool = False
+    reranker_model: str | None = None
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    retryable: bool
+    request_id: str
+    details: dict[str, Any] | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail
 
 
 class ComponentHealth(BaseModel):
@@ -61,7 +87,7 @@ class ComponentHealth(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    status: Literal["ready", "degraded"]
+    status: Literal["ok", "ready", "degraded"]
     backend: ComponentHealth
     ollama: ComponentHealth
     qdrant: ComponentHealth

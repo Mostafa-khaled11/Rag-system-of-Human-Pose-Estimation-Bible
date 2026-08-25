@@ -44,6 +44,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
+    stop_grace_period: 30s
 
   frontend:
     build: ./frontend
@@ -51,8 +52,8 @@ services:
     ports: ["3000:80"]
     depends_on:
       backend: {condition: service_healthy}
+    stop_grace_period: 15s
 
 volumes:
   ollama_data:
   qdrant_data:
-
